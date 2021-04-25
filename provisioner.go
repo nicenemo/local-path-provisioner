@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -36,18 +37,23 @@ var (
 	CmdTimeoutCounts = 120
 
 	ConfigFileCheckInterval = 30 * time.Second
+
+	HelperPodNameMaxLength = 128
 )
 
 type LocalPathProvisioner struct {
-	stopCh      chan struct{}
-	kubeClient  *clientset.Clientset
-	namespace   string
-	helperImage string
+	stopCh             chan struct{}
+	kubeClient         *clientset.Clientset
+	namespace          string
+	helperImage        string
+	serviceAccountName string
 
-	config      *Config
-	configData  *ConfigData
-	configFile  string
-	configMutex *sync.RWMutex
+	config        *Config
+	configData    *ConfigData
+	configFile    string
+	configMapName string
+	configMutex   *sync.RWMutex
+	helperPod     *v1.Pod
 }
 
 type NodePathMapData struct {
@@ -67,19 +73,27 @@ type Config struct {
 	NodePathMap map[string]*NodePathMap
 }
 
-func NewProvisioner(stopCh chan struct{}, kubeClient *clientset.Clientset, configFile, namespace, helperImage string) (*LocalPathProvisioner, error) {
+func NewProvisioner(stopCh chan struct{}, kubeClient *clientset.Clientset,
+	configFile, namespace, helperImage, configMapName, serviceAccountName, helperPodYaml string) (*LocalPathProvisioner, error) {
 	p := &LocalPathProvisioner{
 		stopCh: stopCh,
 
-		kubeClient:  kubeClient,
-		namespace:   namespace,
-		helperImage: helperImage,
+		kubeClient:         kubeClient,
+		namespace:          namespace,
+		helperImage:        helperImage,
+		serviceAccountName: serviceAccountName,
 
 		// config will be updated shortly by p.refreshConfig()
-		config:      nil,
-		configFile:  configFile,
-		configData:  nil,
-		configMutex: &sync.RWMutex{},
+		config:        nil,
+		configFile:    configFile,
+		configData:    nil,
+		configMapName: configMapName,
+		configMutex:   &sync.RWMutex{},
+	}
+	var err error
+	p.helperPod, err = loadHelperPodFile(helperPodYaml)
+	if err != nil {
+		return nil, err
 	}
 	if err := p.refreshConfig(); err != nil {
 		return nil, err
@@ -189,15 +203,19 @@ func (p *LocalPathProvisioner) Provision(opts pvController.ProvisionOptions) (*v
 	path := filepath.Join(basePath, folderName)
 	logrus.Infof("Creating volume %v at %v:%v", name, node.Name, path)
 
+	storage := pvc.Spec.Resources.Requests[v1.ResourceName(v1.ResourceStorage)]
+	volMode := string(*pvc.Spec.VolumeMode)
+
 	createCmdsForPath := []string{
 		"/bin/sh",
 		"/script/setup",
 	}
-	if err := p.createHelperPod(ActionTypeCreate, createCmdsForPath, name, path, node.Name); err != nil {
+	if err := p.createHelperPod(ActionTypeCreate, createCmdsForPath, name, path, node.Name, volMode, storage.Value()); err != nil {
 		return nil, err
 	}
 
 	fs := v1.PersistentVolumeFilesystem
+	hostPathType := v1.HostPathDirectoryOrCreate
 	return &v1.PersistentVolume{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name,
@@ -210,8 +228,9 @@ func (p *LocalPathProvisioner) Provision(opts pvController.ProvisionOptions) (*v
 				v1.ResourceName(v1.ResourceStorage): pvc.Spec.Resources.Requests[v1.ResourceName(v1.ResourceStorage)],
 			},
 			PersistentVolumeSource: v1.PersistentVolumeSource{
-				Local: &v1.LocalVolumeSource{
+				HostPath: &v1.HostPathVolumeSource{
 					Path: path,
+					Type: &hostPathType,
 				},
 			},
 			NodeAffinity: &v1.VolumeNodeAffinity{
@@ -245,8 +264,10 @@ func (p *LocalPathProvisioner) Delete(pv *v1.PersistentVolume) (err error) {
 	}
 	if pv.Spec.PersistentVolumeReclaimPolicy != v1.PersistentVolumeReclaimRetain {
 		logrus.Infof("Deleting volume %v at %v:%v", pv.Name, node, path)
+		storage := pv.Spec.Capacity[v1.ResourceName(v1.ResourceStorage)]
+		volMode := string(*pv.Spec.VolumeMode)
 		cleanupCmdsForPath := []string{"/bin/sh", "/script/teardown"}
-		if err := p.createHelperPod(ActionTypeDelete, cleanupCmdsForPath, pv.Name, path, node); err != nil {
+		if err := p.createHelperPod(ActionTypeDelete, cleanupCmdsForPath, pv.Name, path, node, volMode, storage.Value()); err != nil {
 			logrus.Infof("clean up volume %v failed: %v", pv.Name, err)
 			return err
 		}
@@ -261,11 +282,11 @@ func (p *LocalPathProvisioner) getPathAndNodeForPV(pv *v1.PersistentVolume) (pat
 		err = errors.Wrapf(err, "failed to delete volume %v", pv.Name)
 	}()
 
-	local := pv.Spec.PersistentVolumeSource.Local
-	if local == nil {
-		return "", "", fmt.Errorf("no Local set")
+	hostPath := pv.Spec.PersistentVolumeSource.HostPath
+	if hostPath == nil {
+		return "", "", fmt.Errorf("no HostPath set")
 	}
-	path = local.Path
+	path = hostPath.Path
 
 	nodeAffinity := pv.Spec.NodeAffinity
 	if nodeAffinity == nil {
@@ -297,7 +318,7 @@ func (p *LocalPathProvisioner) getPathAndNodeForPV(pv *v1.PersistentVolume) (pat
 	return path, node, nil
 }
 
-func (p *LocalPathProvisioner) createHelperPod(action ActionType, cmdsForPath []string, name, path, node string) (err error) {
+func (p *LocalPathProvisioner) createHelperPod(action ActionType, cmdsForPath []string, name, path, node, volumeMode string, sizeInBytes int64) (err error) {
 	defer func() {
 		err = errors.Wrapf(err, "failed to %v volume %v", action, name)
 	}()
@@ -316,77 +337,78 @@ func (p *LocalPathProvisioner) createHelperPod(action ActionType, cmdsForPath []
 		// it covers the `/` case
 		return fmt.Errorf("invalid path %v for %v: cannot find parent dir or volume dir", action, path)
 	}
-
 	hostPathType := v1.HostPathDirectoryOrCreate
-	helperPod := &v1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      string(action) + "-" + name,
-			Namespace: p.namespace,
+	lpvVolumes := []v1.Volume{
+		{
+			Name: "data",
+			VolumeSource: v1.VolumeSource{
+				HostPath: &v1.HostPathVolumeSource{
+					Path: parentDir,
+					Type: &hostPathType,
+				},
+			},
 		},
-		Spec: v1.PodSpec{
-			RestartPolicy: v1.RestartPolicyNever,
-			NodeName:      node,
-			Tolerations: []v1.Toleration{
-				{
-					Operator: v1.TolerationOpExists,
-				},
-			},
-			Containers: []v1.Container{
-				{
-					Name:    "local-path-" + string(action),
-					Image:   p.helperImage,
-					Command: append(cmdsForPath, filepath.Join("/data/", volumeDir)),
-					VolumeMounts: []v1.VolumeMount{
+		{
+			Name: "script",
+			VolumeSource: v1.VolumeSource{
+				ConfigMap: &v1.ConfigMapVolumeSource{
+					LocalObjectReference: v1.LocalObjectReference{
+						Name: p.configMapName,
+					},
+					Items: []v1.KeyToPath{
 						{
-							Name:      "data",
-							ReadOnly:  false,
-							MountPath: "/data/",
+							Key:  "setup",
+							Path: "setup",
 						},
 						{
-							Name:      "script",
-							ReadOnly:  false,
-							MountPath: "/script",
-						},
-					},
-					ImagePullPolicy: v1.PullIfNotPresent,
-				},
-			},
-			Volumes: []v1.Volume{
-				{
-					Name: "data",
-					VolumeSource: v1.VolumeSource{
-						HostPath: &v1.HostPathVolumeSource{
-							Path: parentDir,
-							Type: &hostPathType,
-						},
-					},
-				},
-				{
-					Name: "script",
-					VolumeSource: v1.VolumeSource{
-						ConfigMap: &v1.ConfigMapVolumeSource{
-							LocalObjectReference: v1.LocalObjectReference{
-								Name: "local-path-config",
-							},
-							Items: []v1.KeyToPath{
-								{
-									Key:  "setup",
-									Path: "setup",
-								},
-								{
-									Key:  "teardown",
-									Path: "teardown",
-								},
-							},
+							Key:  "teardown",
+							Path: "teardown",
 						},
 					},
 				},
 			},
 		},
 	}
+	lpvVolumeMounts := []v1.VolumeMount{
+		{
+			Name:      "data",
+			ReadOnly:  false,
+			MountPath: parentDir,
+		},
+		{
+			Name:      "script",
+			ReadOnly:  false,
+			MountPath: "/script",
+		},
+	}
+	lpvTolerations := []v1.Toleration{
+		{
+			Operator: v1.TolerationOpExists,
+		},
+	}
+	helperPod := p.helperPod.DeepCopy()
+
+	// use different name for helper pods
+	// https://github.com/rancher/local-path-provisioner/issues/154
+	helperPod.Name = (helperPod.Name + "-" + string(action) + "-" + name)
+	if len(helperPod.Name) > HelperPodNameMaxLength {
+		helperPod.Name = helperPod.Name[:HelperPodNameMaxLength]
+	}
+	helperPod.Namespace = p.namespace
+	helperPod.Spec.NodeName = node
+	helperPod.Spec.ServiceAccountName = p.serviceAccountName
+	helperPod.Spec.RestartPolicy = v1.RestartPolicyNever
+	helperPod.Spec.Tolerations = append(helperPod.Spec.Tolerations, lpvTolerations...)
+	helperPod.Spec.Volumes = append(helperPod.Spec.Volumes, lpvVolumes...)
+	helperPod.Spec.Containers[0].VolumeMounts = append(helperPod.Spec.Containers[0].VolumeMounts, lpvVolumeMounts...)
+	helperPod.Spec.Containers[0].Command = cmdsForPath
+	helperPod.Spec.Containers[0].Args = []string{"-p", filepath.Join(parentDir, volumeDir),
+		"-s", strconv.FormatInt(sizeInBytes, 10),
+		"-m", volumeMode}
 
 	// If it already exists due to some previous errors, the pod will be cleaned up later automatically
 	// https://github.com/rancher/local-path-provisioner/issues/27
+	logrus.Infof("create the helper pod %s into %s", helperPod.Name, p.namespace)
 	_, err = p.kubeClient.CoreV1().Pods(p.namespace).Create(helperPod)
 	if err != nil && !k8serror.IsAlreadyExists(err) {
 		return err
@@ -417,10 +439,27 @@ func (p *LocalPathProvisioner) createHelperPod(action ActionType, cmdsForPath []
 	return nil
 }
 
+func isJSONFile(configFile string) bool {
+	return strings.HasSuffix(configFile, ".json")
+}
+
+func unmarshalFromString(configFile string) (*ConfigData, error) {
+	var data ConfigData
+	if err := json.Unmarshal([]byte(configFile), &data); err != nil {
+		return nil, err
+	}
+	return &data, nil
+}
+
 func loadConfigFile(configFile string) (cfgData *ConfigData, err error) {
 	defer func() {
 		err = errors.Wrapf(err, "fail to load config file %v", configFile)
 	}()
+
+	if !isJSONFile(configFile) {
+		return unmarshalFromString(configFile)
+	}
+
 	f, err := os.Open(configFile)
 	if err != nil {
 		return nil, err

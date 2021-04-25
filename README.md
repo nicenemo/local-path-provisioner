@@ -3,12 +3,12 @@
 
 ## Overview
 
-Local Path Provisioner provides a way for the Kubernetes users to utilize the local storage in each node. Based on the user configuration, the Local Path Provisioner will create `local` based persistent volume on the node automatically. It utilizes the features introduced by Kubernetes [Local Persistent Volume feature](https://kubernetes.io/blog/2018/04/13/local-persistent-volumes-beta/), but make it a simpler solution than the built-in `local` volume feature in Kubernetes.
+Local Path Provisioner provides a way for the Kubernetes users to utilize the local storage in each node. Based on the user configuration, the Local Path Provisioner will create `hostPath` based persistent volume on the node automatically. It utilizes the features introduced by Kubernetes [Local Persistent Volume feature](https://kubernetes.io/blog/2018/04/13/local-persistent-volumes-beta/), but make it a simpler solution than the built-in `local` volume feature in Kubernetes.
 
 ## Compare to built-in Local Persistent Volume feature in Kubernetes
 
 ### Pros
-Dynamic provisioning the volume using [local volume](https://kubernetes.io/docs/concepts/storage/volumes/#local).
+Dynamic provisioning the volume using hostPath.
 * Currently the Kubernetes [Local Volume provisioner](https://github.com/kubernetes-sigs/sig-storage-local-static-provisioner) cannot do dynamic provisioning for the local volumes.
 
 ### Cons
@@ -28,6 +28,11 @@ In this setup, the directory `/opt/local-path-provisioner` will be used across a
 kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/master/deploy/local-path-storage.yaml
 ```
 
+Or, use `kustomize` to deploy.
+```
+kustomize build "github.com/rancher/local-path-provisioner/deploy?ref=master" | kubectl apply -f -
+```
+
 After installation, you should see something like the following:
 ```
 $ kubectl -n local-path-storage get pod
@@ -42,11 +47,15 @@ $ kubectl -n local-path-storage logs -f -l app=local-path-provisioner
 
 ## Usage
 
-Create a `local` backend Persistent Volume and a pod uses it:
-
+Create a `hostPath` backend Persistent Volume and a pod uses it:
 ```
-kubectl create -f https://raw.githubusercontent.com/rancher/local-path-provisioner/master/examples/pvc.yaml
-kubectl create -f https://raw.githubusercontent.com/rancher/local-path-provisioner/master/examples/pod.yaml
+kubectl create -f https://raw.githubusercontent.com/rancher/local-path-provisioner/master/examples/pvc/pvc.yaml
+kubectl create -f https://raw.githubusercontent.com/rancher/local-path-provisioner/master/examples/pod/pod.yaml
+```
+
+Or, use `kustomize` to deploy them.
+```
+kustomize build "github.com/rancher/local-path-provisioner/examples/pod?ref=master" | kubectl apply -f -
 ```
 
 You should see the PV has been created:
@@ -77,12 +86,12 @@ kubectl exec volume-test -- sh -c "echo local-path-test > /data/test"
 
 Now delete the pod using
 ```
-kubectl delete -f https://raw.githubusercontent.com/rancher/local-path-provisioner/master/examples/pod.yaml
+kubectl delete -f https://raw.githubusercontent.com/rancher/local-path-provisioner/master/examples/pod/pod.yaml
 ```
 
 After confirm that the pod is gone, recreated the pod using
 ```
-kubectl create -f https://raw.githubusercontent.com/rancher/local-path-provisioner/master/examples/pod.yaml
+kubectl create -f https://raw.githubusercontent.com/rancher/local-path-provisioner/master/examples/pod/pod.yaml
 ```
 
 Check the volume content:
@@ -93,8 +102,13 @@ local-path-test
 
 Delete the pod and pvc
 ```
-kubectl delete -f https://raw.githubusercontent.com/rancher/local-path-provisioner/master/examples/pod.yaml
-kubectl delete -f https://raw.githubusercontent.com/rancher/local-path-provisioner/master/examples/pvc.yaml
+kubectl delete -f https://raw.githubusercontent.com/rancher/local-path-provisioner/master/examples/pod/pod.yaml
+kubectl delete -f https://raw.githubusercontent.com/rancher/local-path-provisioner/master/examples/pvc/pvc.yaml
+```
+
+Or, use `kustomize` to delete them.
+```
+kustomize build "github.com/rancher/local-path-provisioner/examples/pod?ref=master" | kubectl delete -f -
 ```
 
 The volume content stored on the node will be automatically cleaned up. You can check the log of `local-path-provisioner-xxx` for details.
@@ -102,6 +116,8 @@ The volume content stored on the node will be automatically cleaned up. You can 
 Now you've verified that the provisioner works as expected.
 
 ## Configuration
+
+### Customize the ConfigMap
 
 The configuration of the provisioner is a json file `config.json` and two bash scripts `setup` and `teardown`, stored in the a config map, e.g.:
 ```
@@ -130,25 +146,62 @@ data:
         }
   setup: |-
         #!/bin/sh
-        path=$1
-        mkdir -m 0777 -p ${path}
+        while getopts "m:s:p:" opt
+        do
+            case $opt in
+                p)
+                absolutePath=$OPTARG
+                ;;
+                s)
+                sizeInBytes=$OPTARG
+                ;;
+                m)
+                volMode=$OPTARG
+                ;;
+            esac
+        done
+
+        mkdir -m 0777 -p ${absolutePath}
   teardown: |-
         #!/bin/sh
-        path=$1
-        rm -rf ${path}
+        while getopts "m:s:p:" opt
+        do
+            case $opt in
+                p)
+                absolutePath=$OPTARG
+                ;;
+                s)
+                sizeInBytes=$OPTARG
+                ;;
+                m)
+                volMode=$OPTARG
+                ;;
+            esac
+        done
+
+        rm -rf ${absolutePath}
+  helperPod.yaml: |-
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          name: helper-pod
+        spec:
+          containers:
+          - name: helper-pod
+            image: busybox
 
 ```
 
-### `config.json`
+#### `config.json`
 
-#### Definition
+##### Definition
 `nodePathMap` is the place user can customize where to store the data on each node.
 1. If one node is not listed on the `nodePathMap`, and Kubernetes wants to create volume on it, the paths specified in `DEFAULT_PATH_FOR_NON_LISTED_NODES` will be used for provisioning.
 2. If one node is listed on the `nodePathMap`, the specified paths in `paths` will be used for provisioning.
     1. If one node is listed but with `paths` set to `[]`, the provisioner will refuse to provision on this node.
     2. If more than one path was specified, the path would be chosen randomly when provisioning.
 
-#### Rules
+##### Rules
 The configuration must obey following rules:
 1. `config.json` must be a valid json file.
 2. A path must start with `/`, a.k.a an absolute path.
@@ -156,13 +209,18 @@ The configuration must obey following rules:
 3. No duplicate paths allowed for one node.
 4. No duplicate node allowed.
 
-### Scripts `setup` and `teardown`
+#### Scripts `setup` and `teardown` and `helperPod.yaml`
 
 The script `setup` will be executed before the volume is created, to prepare the directory on the node for the volume.
 
 The script `teardown` will be executed after the volume is deleted, to cleanup the directory on the node for the volume.
 
-### Reloading
+The yaml file `helperPod.yaml` will be created by local-path-storage to execute `setup` or `teardown` script with three paramemters  `-p <path> -s <size> -m <mode>` :
+* path: the absolute path provisioned on the node
+- size: pvc.Spec.resources.requests.storage in bytes
+* mode: pvc.Spec.VolumeMode
+
+#### Reloading
 
 The provisioner supports automatic configuration reloading. Users can change the configuration using `kubectl apply` or `kubectl edit` with config map `local-path-config`. There is a delay between when the user updates the config map and the provisioner picking it up.
 
@@ -186,6 +244,25 @@ To uninstall, execute:
 
 ```
 kubectl delete -f https://raw.githubusercontent.com/rancher/local-path-provisioner/master/deploy/local-path-storage.yaml
+```
+
+## Debug
+> it providers a out-of-cluster debug env for deverlopers
+### debug
+```Bash
+git clone https://github.com/rancher/local-path-provisioner.git
+cd local-path-provisioner
+go build
+kubectl apply -f debug/config.yaml
+./local-path-provisioner --debug start --service-account-name=default
+```
+
+### example
+[Usage](#usage)
+
+### clear
+```
+kubectl delete -f debug/config.yaml
 ```
 
 ## License

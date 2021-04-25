@@ -4,12 +4,20 @@ replicaCount: 1
 
 image:
   repository: rancher/local-path-provisioner
-  tag: v0.0.14
+  tag: v0.0.19
   pullPolicy: IfNotPresent
 
 helperImage:
   repository: busybox
   tag: latest
+
+defaultSettings:
+  registrySecret: ~
+
+privateRegistry:
+  registryUrl: ~
+  registryUser: ~
+  registryPasswd: ~
 
 imagePullSecrets: []
 nameOverride: ""
@@ -79,12 +87,58 @@ tolerations: []
 
 affinity: {}
 
-setup: |-
-  #!/bin/sh
-  path=$1
-  mkdir -m 0777 -p ${path}
+configmap:
+  # specify the config map name
+  name: local-path-config
+  # specify the custom script for setup and teardown
+  setup: |-
+    #!/bin/sh
+    while getopts "m:s:p:" opt
+    do
+        case $opt in
+            p)
+            absolutePath=$OPTARG
+            ;;
+            s)
+            sizeInBytes=$OPTARG
+            ;;
+            m)
+            volMode=$OPTARG
+            ;;
+        esac
+    done
 
-teardown: |-
-  #!/bin/sh
-  path=$1
-  rm -rf ${path}
+    mkdir -m 0777 -p ${absolutePath}
+  teardown: |-
+    #!/bin/sh
+    while getopts "m:s:p:" opt
+    do
+        case $opt in
+            p)
+            absolutePath=$OPTARG
+            ;;
+            s)
+            sizeInBytes=$OPTARG
+            ;;
+            m)
+            volMode=$OPTARG
+            ;;
+        esac
+    done
+
+    rm -rf ${absolutePath}
+  # specify the custom helper pod yaml
+  helperPod: |-
+    apiVersion: v1
+    kind: Pod
+    metadata:
+      name: helper-pod
+    spec:
+      containers:
+      - name: helper-pod
+        image: busybox
+
+
+
+
+
